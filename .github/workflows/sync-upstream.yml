@@ -1,0 +1,126 @@
+# 上游自动同步：每周把 gansx/actions-sync-fixture 的最新代码合并进本 fork
+#
+# 触发时机：
+#   - 定时：每周一 03:17 UTC（北京时间 11:17），避开整点高峰
+#   - 手动：Actions 页面点 "Run workflow"
+#
+# 行为：
+#   1. 拉取 upstream/main 全部提交与 tag
+#   2. 若本 fork 没有任何本地提交 → 直接 fast-forward
+#   3. 若有本地提交 → 创建合并提交；冲突则中止并保留原状，不会强推
+#   4. 推送成功后输出新旧 commit 对比
+#
+# 注意：本仓库的默认 GITHUB_TOKEN 在 fork 中可能无写权限，
+#      因此优先使用 PAT（见 README 或 secret SYNC_TOKEN），
+#      没有配置 PAT 时回退到 GITHUB_TOKEN。
+
+name: Sync upstream
+
+on:
+  schedule:
+    # 每周一 03:17 UTC = 北京时间 11:17
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_merge:
+        description: '即使有冲突也尝试合并（仍不会强推）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: gansx/actions-sync-fixture
+  UPSTREAM_BRANCH: main
+  LOCAL_BRANCH: main
+
+jobs:
+  sync:
+    name: Merge upstream into fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.LOCAL_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}" --tags --prune
+          git fetch origin "${LOCAL_BRANCH}"
+
+      - name: Report incoming changes
+        id: incoming
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/${UPSTREAM_BRANCH})
+          AHEAD=$(git rev-list --count upstream/${UPSTREAM_BRANCH}..HEAD)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD"   >> "$GITHUB_OUTPUT"
+          echo "本 fork 落后上游 ${BEHIND} 个提交，领先 ${AHEAD} 个提交。"
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "--- 待合入的提交 ---"
+            git log --oneline HEAD..upstream/${UPSTREAM_BRANCH} | head -40
+          fi
+
+      - name: Skip when already up to date
+        if: steps.incoming.outputs.behind == '0'
+        run: |
+          echo "已是最新，无需同步。"
+          echo "::notice title=Already up to date::上游没有新提交"
+
+      - name: Fast-forward when fork has no local commits
+        if: steps.incoming.outputs.behind != '0' && steps.incoming.outputs.ahead == '0'
+        run: |
+          echo "fork 无本地改动，执行 fast-forward。"
+          git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
+          git push origin "HEAD:${LOCAL_BRANCH}"
+
+      - name: Merge when fork has local commits
+        if: steps.incoming.outputs.behind != '0' && steps.incoming.outputs.ahead != '0'
+        run: |
+          echo "fork 有本地改动，创建合并提交。"
+          if git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            git push origin "HEAD:${LOCAL_BRANCH}"
+          else
+            echo "::warning title=Merge conflict::上游改动与本地改动冲突，已中止；fork 保持原状未被修改。"
+            git merge --abort || true
+            echo "--- 冲突文件 ---"
+            git diff --name-only --diff-filter=U || true
+            exit 1
+          fi
+
+      - name: Push tags
+        if: steps.incoming.outputs.behind != '0'
+        run: |
+          git push origin --tags || echo "::warning title=Tags not pushed::部分 tag 推送失败（通常是已存在且不冲突）"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 | \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\` |"
+            echo "| 落后提交数 | ${{ steps.incoming.outputs.behind }} |"
+            echo "| 本地领先数 | ${{ steps.incoming.outputs.ahead }} |"
+            echo "| 当前 HEAD | \`$(git rev-parse --short HEAD 2>/dev/null || echo n/a)\` |"
+            echo "| 上游 HEAD | \`$(git rev-parse --short upstream/${UPSTREAM_BRANCH} 2>/dev/null || echo n/a)\` |"
+            echo "| 结果 | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
